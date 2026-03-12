@@ -4,8 +4,55 @@ import {
   XAxis, YAxis, CartesianGrid, Tooltip, Area, AreaChart
 } from "recharts";
 
-// ─── Simulated ML prediction ───────────────────────────────────────────
-function simulatePrediction(data) {
+// ─── API Config ────────────────────────────────────────────────────────
+const API_BASE = "http://localhost:8000";
+
+// ─── Real API call to FastAPI backend ─────────────────────────────────
+async function callPredictAPI(data, patientName = "") {
+  const payload = {
+    age:      Number(data.age),
+    sex:      Number(data.sex),
+    cp:       Number(data.cp),
+    trestbps: Number(data.trestbps),
+    chol:     Number(data.chol),
+    fbs:      Number(data.fbs),
+    restecg:  Number(data.restecg),
+    thalach:  Number(data.thalach),
+    exang:    Number(data.exang),
+    oldpeak:  Number(data.oldpeak),
+    slope:    Number(data.slope),
+    ca:       Number(data.ca),
+    thal:     Number(data.thal),
+    patient_name: patientName,
+  };
+  const res = await fetch(`${API_BASE}/predict`, {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body:    JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.detail || `Server error ${res.status}`);
+  }
+  return res.json();
+}
+
+// ─── Check if backend is reachable ────────────────────────────────────
+async function checkBackendHealth() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3000);
+  try {
+    const res = await fetch(`${API_BASE}/health`, { signal: controller.signal });
+    clearTimeout(timer);
+    return res.ok;
+  } catch {
+    clearTimeout(timer);
+    return false;
+  }
+}
+
+// ─── Local fallback prediction (used when backend is offline) ─────────
+function localFallbackPrediction(data) {
   const { age, sex, cp, trestbps, chol, fbs, thalach, exang, oldpeak, ca, thal } = data;
   let score =
     0.03 * ((age - 29) / 48) * 48 +
@@ -22,7 +69,7 @@ function simulatePrediction(data) {
   const prob = Math.min(0.97, Math.max(0.03, score / 3.2));
   const riskScore = Math.round(prob * 100);
   const category = prob < 0.35 ? "Low Risk" : prob < 0.65 ? "Moderate Risk" : "High Risk";
-  return { risk_score: riskScore, risk_category: category, probability: prob };
+  return { risk_score: riskScore, risk_category: category, probability: prob, _fallback: true };
 }
 
 function getDietPlan(category) {
@@ -262,6 +309,33 @@ const clinicalFields = [
   { key: "thal",     label: "Thalassemia",              type: "select",  options: [{ v: 1, l: "Normal" }, { v: 2, l: "Fixed Defect" }, { v: 3, l: "Reversible Defect" }] },
 ];
 
+// ─── localStorage persistence helpers ────────────────────────────────
+const STORAGE_KEY = "cardiocare_patients";
+
+function loadPatients() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+    }
+  } catch (_) { /* corrupted data — fall back to seed */ }
+  return null;
+}
+
+function savePatients(patients) {
+  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(patients)); }
+  catch (_) { console.warn("CardioCare: could not save patients to localStorage"); }
+}
+
+// ─── Initial patient seed data (shared default state) ─────────────────
+const INITIAL_PATIENTS = [
+  { id:genId(), name:"Marcus Johnson",  age:58, sex:1, email:"marcus@gmail.com",  phone:"+1 555-0101", bloodType:"B+",  allergies:"None",       medHistory:"Hypertension (2018)",         notes:"On Lisinopril 10mg",  address:"14 Oak Ave, Boston, MA",  color:"#f43f5e", lastScore:72, history:[], createdAt:"2024-11-01T10:00:00Z" },
+  { id:genId(), name:"Elena Chen",      age:45, sex:0, email:"echen@gmail.com",   phone:"+1 555-0202", bloodType:"A+",  allergies:"Penicillin", medHistory:"None",                       notes:"Annual check-up",     address:"22 Elm St, Chicago, IL",  color:"#2dd4bf", lastScore:28, history:[], createdAt:"2024-12-05T09:00:00Z" },
+  { id:genId(), name:"David Park",      age:63, sex:1, email:"dpark@gmail.com",   phone:"+1 555-0303", bloodType:"O-",  allergies:"Aspirin",    medHistory:"Type 2 Diabetes (2020)",     notes:"Monitor HbA1c",      address:"5 Maple Rd, Houston, TX", color:"#fb923c", lastScore:55, history:[], createdAt:"2025-01-12T11:30:00Z" },
+  { id:genId(), name:"Sarah Mitchell",  age:51, sex:0, email:"smitch@gmail.com",  phone:"+1 555-0404", bloodType:"AB+", allergies:"None",       medHistory:"Family hx of heart disease", notes:"Smoker, 10 cig/day", address:"8 Pine St, Phoenix, AZ",  color:"#818cf8", lastScore:41, history:[], createdAt:"2025-01-28T14:00:00Z" },
+];
+
 // ─── ChatBot ───────────────────────────────────────────────────────────
 function ChatBot() {
   const [open, setOpen] = useState(false);
@@ -477,28 +551,32 @@ function RiskGauge({ score, size = 180 }) {
 }
 
 // ─── Add / Edit Patient Modal ──────────────────────────────────────────
+// NOTE: All fields are inlined — NO inner component helpers (F, Field, etc.)
+// Defining a component inside another component causes React to treat it as a
+// NEW type on every render, unmounting the input and losing focus each keystroke.
 function PatientModal({ patient, onClose, onSave }) {
   const isEdit = !!patient?.id;
   const [form, setForm] = useState({
-    name:       patient?.name      || "",
-    age:        patient?.age       || "",
-    sex:        patient?.sex       ?? 1,
-    dob:        patient?.dob       || "",
-    email:      patient?.email     || "",
-    phone:      patient?.phone     || "",
-    address:    patient?.address   || "",
-    bloodType:  patient?.bloodType || "",
-    allergies:  patient?.allergies || "",
-    medHistory: patient?.medHistory|| "",
-    notes:      patient?.notes     || "",
+    name:       patient?.name       || "",
+    age:        patient?.age        || "",
+    sex:        patient?.sex        ?? 1,
+    dob:        patient?.dob        || "",
+    email:      patient?.email      || "",
+    phone:      patient?.phone      || "",
+    address:    patient?.address    || "",
+    bloodType:  patient?.bloodType  || "",
+    allergies:  patient?.allergies  || "",
+    medHistory: patient?.medHistory || "",
+    notes:      patient?.notes      || "",
   });
   const [err, setErr] = useState("");
 
-  const set = (k, v) => setForm(p => ({ ...p, [k]: v }));
+  const set = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value }));
+  const setNum = (k) => (e) => setForm(p => ({ ...p, [k]: e.target.value === "" ? "" : Number(e.target.value) }));
 
   const validate = () => {
     if (!form.name.trim()) { setErr("Patient name is required."); return false; }
-    if (!form.age || form.age < 1 || form.age > 120) { setErr("Please enter a valid age (1–120)."); return false; }
+    if (!form.age || Number(form.age) < 1 || Number(form.age) > 120) { setErr("Please enter a valid age (1–120)."); return false; }
     if (!form.email.trim()) { setErr("Email address is required."); return false; }
     return true;
   };
@@ -506,37 +584,20 @@ function PatientModal({ patient, onClose, onSave }) {
   const handleSave = () => {
     if (!validate()) return;
     setErr("");
-    const ac = avatarColor(form.name);
     onSave({
       ...patient,
-      id:         patient?.id || genId(),
+      id:        patient?.id || genId(),
       ...form,
-      age:        Number(form.age),
-      lastScore:  patient?.lastScore ?? null,
-      history:    patient?.history   ?? [],
-      color:      ac,
-      createdAt:  patient?.createdAt || new Date().toISOString(),
+      age:       Number(form.age),
+      lastScore: patient?.lastScore ?? null,
+      history:   patient?.history   ?? [],
+      color:     avatarColor(form.name),
+      createdAt: patient?.createdAt || new Date().toISOString(),
     });
   };
 
-  const F = ({ label, k, type="text", placeholder="", span=false, options=null, min, max }) => (
-    <div className={span ? "col-span-2" : ""}>
-      <label className="input-label">{label}</label>
-      {options ? (
-        <select className="input-field" value={form[k]} onChange={e => set(k, isNaN(e.target.value) ? e.target.value : Number(e.target.value))}>
-          {options.map(o => <option key={o.v} value={o.v}>{o.l}</option>)}
-        </select>
-      ) : type === "textarea" ? (
-        <textarea className="input-field" placeholder={placeholder} value={form[k]} onChange={e => set(k, e.target.value)} />
-      ) : (
-        <input className="input-field" type={type} placeholder={placeholder} min={min} max={max}
-          value={form[k]} onChange={e => set(k, e.target.value)} />
-      )}
-    </div>
-  );
-
   return (
-    <div className="modal-overlay" onClick={e => e.target===e.currentTarget && onClose()}>
+    <div className="modal-overlay" onClick={e => e.target === e.currentTarget && onClose()}>
       <div className="modal">
         <div className="modal-header">
           <div>
@@ -556,37 +617,87 @@ function PatientModal({ patient, onClose, onSave }) {
           {/* ── Personal Info ── */}
           <div className="section-divider">👤 Personal Information</div>
           <div className="form-grid-2">
-            <F label="Full Name *"       k="name"  placeholder="e.g. Marcus Johnson" span />
-            <F label="Age (years) *"     k="age"   type="number" min={1} max={120} placeholder="e.g. 52" />
-            <F label="Sex"               k="sex"   options={[{v:1,l:"Male"},{v:0,l:"Female"}]} />
-            <F label="Date of Birth"     k="dob"   type="date" />
-            <F label="Email Address *"   k="email" type="email" placeholder="patient@gmail.com" />
-            <F label="Phone Number"      k="phone" type="tel"  placeholder="+1 (555) 000-0000" />
+            {/* Full Name — spans both columns */}
+            <div className="col-span-2">
+              <label className="input-label">Full Name *</label>
+              <input className="input-field" placeholder="e.g. Marcus Johnson"
+                value={form.name} onChange={set("name")} />
+            </div>
+            {/* Age */}
+            <div>
+              <label className="input-label">Age (years) *</label>
+              <input className="input-field" type="number" min={1} max={120} placeholder="e.g. 52"
+                value={form.age} onChange={set("age")} />
+            </div>
+            {/* Sex */}
+            <div>
+              <label className="input-label">Sex</label>
+              <select className="input-field" value={form.sex} onChange={setNum("sex")}>
+                <option value={1}>Male</option>
+                <option value={0}>Female</option>
+              </select>
+            </div>
+            {/* Date of Birth */}
+            <div>
+              <label className="input-label">Date of Birth</label>
+              <input className="input-field" type="date"
+                value={form.dob} onChange={set("dob")} />
+            </div>
+            {/* Email */}
+            <div>
+              <label className="input-label">Email Address *</label>
+              <input className="input-field" type="email" placeholder="patient@gmail.com"
+                value={form.email} onChange={set("email")} />
+            </div>
+            {/* Phone */}
+            <div>
+              <label className="input-label">Phone Number</label>
+              <input className="input-field" type="tel" placeholder="+1 (555) 000-0000"
+                value={form.phone} onChange={set("phone")} />
+            </div>
           </div>
 
           {/* ── Medical Info ── */}
           <div className="section-divider" style={{ marginTop:20 }}>🩺 Medical Information</div>
           <div className="form-grid-3">
-            <F label="Blood Type"  k="bloodType" options={[
-              {v:"",l:"Unknown"},{v:"A+",l:"A+"},{v:"A-",l:"A-"},{v:"B+",l:"B+"},{v:"B-",l:"B-"},
-              {v:"AB+",l:"AB+"},{v:"AB-",l:"AB-"},{v:"O+",l:"O+"},{v:"O-",l:"O-"}
-            ]} />
+            {/* Blood Type */}
+            <div>
+              <label className="input-label">Blood Type</label>
+              <select className="input-field" value={form.bloodType} onChange={set("bloodType")}>
+                <option value="">Unknown</option>
+                <option value="A+">A+</option><option value="A-">A-</option>
+                <option value="B+">B+</option><option value="B-">B-</option>
+                <option value="AB+">AB+</option><option value="AB-">AB-</option>
+                <option value="O+">O+</option><option value="O-">O-</option>
+              </select>
+            </div>
+            {/* Allergies — spans remaining 2 cols */}
             <div className="col-span-2">
               <label className="input-label">Known Allergies</label>
-              <input className="input-field" placeholder="e.g. Penicillin, Aspirin, None" value={form.allergies}
-                onChange={e => set("allergies", e.target.value)} />
+              <input className="input-field" placeholder="e.g. Penicillin, Aspirin, None"
+                value={form.allergies} onChange={set("allergies")} />
             </div>
           </div>
+          {/* Medical History */}
           <div style={{ marginTop:14 }}>
-            <F label="Medical History" k="medHistory" type="textarea" placeholder="e.g. Hypertension (2018), Type 2 Diabetes (2020), Previous MI (2022)..." span />
+            <label className="input-label">Medical History</label>
+            <textarea className="input-field" placeholder="e.g. Hypertension (2018), Type 2 Diabetes (2020), Previous MI (2022)..."
+              value={form.medHistory} onChange={set("medHistory")} />
           </div>
+          {/* Doctor Notes */}
           <div style={{ marginTop:14 }}>
-            <F label="Doctor's Notes" k="notes" type="textarea" placeholder="Any additional observations, current medications, lifestyle notes..." span />
+            <label className="input-label">Doctor's Notes</label>
+            <textarea className="input-field" placeholder="Any additional observations, current medications, lifestyle notes..."
+              value={form.notes} onChange={set("notes")} />
           </div>
 
-          {/* ── Contact ── */}
+          {/* ── Address ── */}
           <div className="section-divider" style={{ marginTop:20 }}>📍 Address</div>
-          <F label="Street Address" k="address" placeholder="123 Main St, City, State, ZIP" span />
+          <div>
+            <label className="input-label">Street Address</label>
+            <input className="input-field" placeholder="123 Main St, City, State, ZIP"
+              value={form.address} onChange={set("address")} />
+          </div>
         </div>
 
         <div className="modal-footer">
@@ -625,14 +736,8 @@ function DeleteModal({ patient, onClose, onConfirm }) {
 }
 
 // ─── Doctor Dashboard ──────────────────────────────────────────────────
-function DoctorDashboard({ user, navigate }) {
+function DoctorDashboard({ user, navigate, patients, setPatients }) {
   const [activeNav,       setActiveNav]       = useState("analyze");
-  const [patients,        setPatients]        = useState([
-    { id:genId(), name:"Marcus Johnson",  age:58, sex:1, email:"marcus@gmail.com",  phone:"+1 555-0101", bloodType:"B+",  allergies:"None",       medHistory:"Hypertension (2018)",          notes:"On Lisinopril 10mg",   address:"14 Oak Ave, Boston, MA",   color:"#f43f5e", lastScore:72, history:[], createdAt:"2024-11-01T10:00:00Z" },
-    { id:genId(), name:"Elena Chen",      age:45, sex:0, email:"echen@gmail.com",   phone:"+1 555-0202", bloodType:"A+",  allergies:"Penicillin", medHistory:"None",                        notes:"Annual check-up",      address:"22 Elm St, Chicago, IL",   color:"#2dd4bf", lastScore:28, history:[], createdAt:"2024-12-05T09:00:00Z" },
-    { id:genId(), name:"David Park",      age:63, sex:1, email:"dpark@gmail.com",   phone:"+1 555-0303", bloodType:"O-",  allergies:"Aspirin",    medHistory:"Type 2 Diabetes (2020)",      notes:"Monitor HbA1c",        address:"5 Maple Rd, Houston, TX",  color:"#fb923c", lastScore:55, history:[], createdAt:"2025-01-12T11:30:00Z" },
-    { id:genId(), name:"Sarah Mitchell",  age:51, sex:0, email:"smitch@gmail.com",  phone:"+1 555-0404", bloodType:"AB+", allergies:"None",       medHistory:"Family hx of heart disease",  notes:"Smoker, 10 cig/day",   address:"8 Pine St, Phoenix, AZ",   color:"#818cf8", lastScore:41, history:[], createdAt:"2025-01-28T14:00:00Z" },
-  ]);
   const [selectedId,      setSelectedId]      = useState(null);
   const [clinForm,        setClinForm]        = useState(defaultClinical);
   const [loading,         setLoading]         = useState(false);
@@ -643,8 +748,21 @@ function DoctorDashboard({ user, navigate }) {
   const [deletePatient,   setDeletePatient]   = useState(null);
   const [search,          setSearch]          = useState("");
   const [detailPatient,   setDetailPatient]   = useState(null);
+  const [apiStatus,       setApiStatus]       = useState("checking"); // "checking" | "online" | "offline"
+  const [apiError,        setApiError]        = useState("");
 
   const selectedPatient = patients.find(p => p.id === selectedId) || null;
+
+  // ── Backend health check on mount + every 30s ────────────────────────
+  useEffect(() => {
+    const check = async () => {
+      const ok = await checkBackendHealth();
+      setApiStatus(ok ? "online" : "offline");
+    };
+    check();
+    const timer = setInterval(check, 30000);
+    return () => clearInterval(timer);
+  }, []);
 
   // Auto-fill age & sex from patient profile when selected
   useEffect(() => {
@@ -682,11 +800,22 @@ function DoctorDashboard({ user, navigate }) {
 
   const handleAnalyze = async () => {
     if (!selectedPatient) return;
-    setLoading(true); setResult(null); setPublished(false);
-    await new Promise(r => setTimeout(r, 1800));
-    const res = simulatePrediction({ ...clinForm, age: Number(clinForm.age) });
-    setResult(res);
-    setLoading(false);
+    setLoading(true); setResult(null); setPublished(false); setApiError("");
+    try {
+      const res = await callPredictAPI(
+        { ...clinForm, age: Number(clinForm.age) },
+        selectedPatient.name
+      );
+      setApiStatus("online");
+      setResult(res);
+    } catch (err) {
+      setApiStatus("offline");
+      setApiError(`Backend unreachable: ${err.message}. Showing local fallback prediction.`);
+      const res = localFallbackPrediction({ ...clinForm, age: Number(clinForm.age) });
+      setResult(res);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handlePublish = () => {
@@ -718,6 +847,22 @@ function DoctorDashboard({ user, navigate }) {
         <div style={{ fontSize:11,color:"#64748b",marginBottom:1 }}>Signed in as</div>
         <div style={{ color:"#0ea5e9",fontWeight:600 }}>{user?.name || "Doctor"}</div>
       </div>
+      <div style={{ marginTop:8,padding:"7px 13px",borderRadius:10,fontSize:12,display:"flex",alignItems:"center",gap:7,
+        background: apiStatus==="online" ? "rgba(74,222,128,.08)" : apiStatus==="offline" ? "rgba(244,63,94,.08)" : "rgba(255,255,255,.04)",
+        border: `1px solid ${apiStatus==="online" ? "rgba(74,222,128,.2)" : apiStatus==="offline" ? "rgba(244,63,94,.2)" : "rgba(255,255,255,.06)"}` }}>
+        <div style={{ width:7,height:7,borderRadius:"50%",flexShrink:0,
+          background: apiStatus==="online" ? "#4ade80" : apiStatus==="offline" ? "#f43f5e" : "#fb923c",
+          animation: apiStatus==="checking" ? "pulse 1.5s infinite" : "none" }} />
+        <span style={{ color: apiStatus==="online" ? "#4ade80" : apiStatus==="offline" ? "#f43f5e" : "#fb923c", fontWeight:600 }}>
+          {apiStatus==="online" ? "API Connected" : apiStatus==="offline" ? "API Offline" : "Checking API..."}
+        </span>
+        {apiStatus==="offline" && (
+          <button onClick={async()=>{ setApiStatus("checking"); const ok=await checkBackendHealth(); setApiStatus(ok?"online":"offline"); }}
+            style={{ marginLeft:"auto",background:"none",border:"none",color:"#f43f5e",cursor:"pointer",fontSize:11,padding:0,fontFamily:"inherit",fontWeight:600 }}>
+            Retry
+          </button>
+        )}
+      </div>
       <nav className="sidebar-nav">
         {[
           { key:"analyze",  icon:"🔬", label:"AI Analysis" },
@@ -730,9 +875,19 @@ function DoctorDashboard({ user, navigate }) {
           </button>
         ))}
       </nav>
-      <button className="nav-item" style={{ marginTop:"auto",color:"#f43f5e" }} onClick={() => navigate("landing")}>
-        🚪 Sign Out
-      </button>
+      <div style={{ marginTop:"auto",display:"flex",flexDirection:"column",gap:4 }}>
+        <button className="nav-item" style={{ color:"#475569",fontSize:12 }}
+          onClick={() => {
+            if (window.confirm("Reset all patient data back to the 4 seed patients? This cannot be undone.")) {
+              setPatients(INITIAL_PATIENTS);
+            }
+          }}>
+          🔄 Reset to Seed Data
+        </button>
+        <button className="nav-item" style={{ color:"#f43f5e" }} onClick={() => navigate("landing")}>
+          🚪 Sign Out
+        </button>
+      </div>
     </aside>
   );
 
@@ -741,7 +896,7 @@ function DoctorDashboard({ user, navigate }) {
     <div className="stats-row">
       {[
         { v:patients.length,                                   l:"Total Patients",  icon:"👥" },
-        { v:patients.filter(p=>p.lastScore>=65).length,        l:"High Risk",       icon:"🔴" },
+        { v:patients.filter(p=>p.lastScore !== null && p.lastScore>=65).length,        l:"High Risk",       icon:"🔴" },
         { v:patients.filter(p=>p.lastScore!==null&&p.lastScore<35).length, l:"Low Risk", icon:"🟢" },
         { v:patients.filter(p=>p.lastScore===null).length,     l:"Unassessed",      icon:"⏳" },
       ].map(s => (
@@ -847,7 +1002,7 @@ function DoctorDashboard({ user, navigate }) {
           </div>
           <button className="btn btn-primary" onClick={() => setShowAddModal(true)}>+ Add Patient</button>
         </div>
-        <Stats />
+        {Stats()}
         <div className="card">
           <div style={{ marginBottom:16 }}>
             <div className="search-wrap">
@@ -928,6 +1083,25 @@ function DoctorDashboard({ user, navigate }) {
           <div className={`step-dot ${result?"current":"pending"}`}>{published ? "✓" : "3"}</div>
           <div style={{ fontSize:13,fontWeight:500,color:result?"#0ea5e9":"#475569",whiteSpace:"nowrap" }}>Review & Publish</div>
         </div>
+
+        {/* API status banners */}
+        {apiStatus === "offline" && (
+          <div className="alert alert-warn" style={{ marginBottom:16 }}>
+            ⚠️ <strong>Python backend is offline</strong> — Results will use local fallback model.
+            Start the server with: <code style={{ background:"rgba(0,0,0,.3)",padding:"1px 6px",borderRadius:4,fontSize:12 }}>uvicorn api:app --reload --port 8000</code>
+          </div>
+        )}
+        {apiError && (
+          <div className="alert alert-warn" style={{ marginBottom:16 }}>
+            ⚠️ {apiError}
+            <span className="risk-badge risk-moderate" style={{ marginLeft:8 }}>Fallback Mode</span>
+          </div>
+        )}
+        {result?._fallback && (
+          <div className="alert alert-info" style={{ marginBottom:8 }}>
+            ℹ️ This result was generated by the local fallback model — connect the Python backend for full Random Forest predictions.
+          </div>
+        )}
 
         <div style={{ display:"grid",gridTemplateColumns:"240px 1fr",gap:18 }}>
           {/* Patient selector */}
@@ -1015,21 +1189,24 @@ function DoctorDashboard({ user, navigate }) {
                   </div>
 
                   <button className="btn btn-primary btn-lg" style={{ marginTop:20,width:"100%",justifyContent:"center" }}
-                    onClick={handleAnalyze} disabled={loading || !clinForm.age || !clinForm.trestbps || !clinForm.chol}>
+                    onClick={handleAnalyze} disabled={loading || !clinForm.age || !clinForm.trestbps || !clinForm.chol || !clinForm.thalach || clinForm.oldpeak === ""}>
                     {loading
                       ? <><div className="spinner" />Running AI Analysis...</>
                       : "🧠 Analyze & Predict Risk"
                     }
                   </button>
-                  {(!clinForm.age || !clinForm.trestbps || !clinForm.chol) && !loading && (
+                  {(!clinForm.age || !clinForm.trestbps || !clinForm.chol || !clinForm.thalach || clinForm.oldpeak === "") && !loading && (
                     <div className="alert alert-warn" style={{ marginTop:10 }}>⚠ Age, Resting BP, and Cholesterol are required to run the analysis.</div>
                   )}
                 </div>
 
                 {result && (
                   <div className="result-panel">
-                    <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18 }}>
-                      <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:16 }}>Prediction Result</h3>
+                    <div style={{ display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:18,flexWrap:"wrap",gap:8 }}>
+                      <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:16 }}>
+                        Prediction Result
+                        {result?._fallback && <span style={{ fontSize:10,fontWeight:600,color:"#fb923c",background:"rgba(251,146,60,.12)",border:"1px solid rgba(251,146,60,.2)",borderRadius:100,padding:"2px 8px",marginLeft:8,verticalAlign:"middle" }}>LOCAL FALLBACK</span>}
+                      </h3>
                       <span className={`risk-badge ${resRiskClass}`}>⬤ {result.risk_category}</span>
                     </div>
                     <div style={{ display:"grid",gridTemplateColumns:"auto 1fr",gap:20,alignItems:"center" }}>
@@ -1083,7 +1260,7 @@ function DoctorDashboard({ user, navigate }) {
           <h2 className="page-title">Reports Overview</h2>
           <p className="page-sub">Summary of all patient risk assessments</p>
         </div>
-        <Stats />
+        {Stats()}
         <div style={{ display:"grid",gridTemplateColumns:"1fr 1fr",gap:18 }}>
           <div className="card">
             <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:6 }}>Average Risk Score</h3>
@@ -1092,8 +1269,8 @@ function DoctorDashboard({ user, navigate }) {
               <div>
                 <div style={{ fontSize:13,color:"#94a3b8" }}>{assessed.length} of {patients.length} patients assessed</div>
                 <div style={{ marginTop:10,fontSize:13 }}>
-                  <div style={{ color:"#f43f5e",marginBottom:4 }}>High Risk: {patients.filter(p=>p.lastScore>=65).length}</div>
-                  <div style={{ color:"#fb923c",marginBottom:4 }}>Moderate: {patients.filter(p=>p.lastScore>=35&&p.lastScore<65).length}</div>
+                  <div style={{ color:"#f43f5e",marginBottom:4 }}>High Risk: {patients.filter(p=>p.lastScore !== null && p.lastScore>=65).length}</div>
+                  <div style={{ color:"#fb923c",marginBottom:4 }}>Moderate: {patients.filter(p=>p.lastScore !== null && p.lastScore>=35&&p.lastScore<65).length}</div>
                   <div style={{ color:"#4ade80" }}>Low Risk: {patients.filter(p=>p.lastScore!==null&&p.lastScore<35).length}</div>
                 </div>
               </div>
@@ -1156,7 +1333,7 @@ function DoctorDashboard({ user, navigate }) {
 
   return (
     <div className="dash-layout">
-      <Sidebar />
+      {Sidebar()}
       <main className="dash-main">
         <div style={{ marginBottom:24 }}>
           <h1 className="page-title">
@@ -1167,9 +1344,9 @@ function DoctorDashboard({ user, navigate }) {
           </p>
         </div>
 
-        {activeNav === "analyze"  && <AnalyzeView />}
-        {activeNav === "patients" && <PatientListView />}
-        {activeNav === "reports"  && <ReportsView />}
+        {activeNav === "analyze"  && AnalyzeView()}
+        {activeNav === "patients" && PatientListView()}
+        {activeNav === "reports"  && ReportsView()}
       </main>
 
       {/* Modals */}
@@ -1180,22 +1357,205 @@ function DoctorDashboard({ user, navigate }) {
   );
 }
 
+// ─── PDF Report Generator ──────────────────────────────────────────────
+function generatePDFReport({ patient, user, riskScore, category, diet, recs }) {
+  const reportDate = new Date().toLocaleDateString("en-US", {
+    weekday:"long", year:"numeric", month:"long", day:"numeric"
+  });
+  const riskColor  = category === "High Risk" ? "#e53e3e" : category === "Moderate Risk" ? "#dd6b20" : "#276749";
+  const riskBg     = category === "High Risk" ? "#fff5f5" : category === "Moderate Risk" ? "#fffaf0" : "#f0fff4";
+  const historyRows = (patient?.history || []).slice(0, 8).map(h => `
+    <tr>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${h.date}</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;font-weight:700;color:${
+        h.score >= 65 ? "#e53e3e" : h.score >= 35 ? "#dd6b20" : "#276749"
+      };">${h.score}%</td>
+      <td style="padding:8px 12px;border-bottom:1px solid #e2e8f0;">${h.category}</td>
+    </tr>`).join("");
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <title>CardioCare Medical Report — ${patient?.name || user?.name || "Patient"}</title>
+  <style>
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+    * { box-sizing:border-box; margin:0; padding:0; }
+    body { font-family:'Inter',sans-serif; color:#1a202c; background:#fff; padding:40px; font-size:13px; line-height:1.6; }
+    @media print {
+      body { padding:20px; }
+      .no-print { display:none !important; }
+      @page { margin:1.5cm; size:A4; }
+    }
+
+    /* ── Header ── */
+    .header { display:flex; align-items:center; justify-content:space-between; padding-bottom:20px; border-bottom:3px solid #0ea5e9; margin-bottom:28px; }
+    .logo { display:flex; align-items:center; gap:10px; }
+    .logo-mark { width:44px; height:44px; background:linear-gradient(135deg,#0ea5e9,#2dd4bf); border-radius:10px; display:flex; align-items:center; justify-content:center; font-size:22px; }
+    .logo-text { font-size:22px; font-weight:700; color:#0ea5e9; }
+    .logo-sub  { font-size:11px; color:#718096; margin-top:1px; }
+    .report-meta { text-align:right; font-size:12px; color:#718096; }
+    .report-meta strong { display:block; font-size:14px; color:#1a202c; margin-bottom:3px; }
+
+    /* ── Section titles ── */
+    .section-title { font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:.07em; color:#718096; margin:24px 0 10px; padding-bottom:6px; border-bottom:1px solid #e2e8f0; }
+
+    /* ── Patient info grid ── */
+    .info-grid { display:grid; grid-template-columns:1fr 1fr 1fr; gap:12px; margin-bottom:8px; }
+    .info-item label { display:block; font-size:10.5px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#a0aec0; margin-bottom:3px; }
+    .info-item span  { font-size:13.5px; font-weight:500; color:#2d3748; }
+
+    /* ── Risk score box ── */
+    .risk-box { background:${riskBg}; border:2px solid ${riskColor}; border-radius:12px; padding:20px 24px; display:flex; align-items:center; gap:24px; margin:16px 0; }
+    .risk-score-big { font-size:52px; font-weight:700; color:${riskColor}; line-height:1; }
+    .risk-label { font-size:20px; font-weight:700; color:${riskColor}; margin-bottom:6px; }
+    .risk-desc { font-size:12.5px; color:#4a5568; max-width:400px; line-height:1.65; }
+
+    /* ── Diet plan ── */
+    .diet-title { font-size:15px; font-weight:700; color:#1a202c; margin-bottom:4px; }
+    .diet-desc  { font-size:12.5px; color:#4a5568; margin-bottom:14px; line-height:1.6; }
+    .diet-items { display:grid; grid-template-columns:1fr 1fr; gap:7px; }
+    .diet-item  { display:flex; align-items:center; gap:8px; padding:8px 12px; background:#f7fafc; border-radius:7px; border:1px solid #e2e8f0; font-size:12.5px; color:#2d3748; }
+
+    /* ── Recommendations ── */
+    .rec-item { display:flex; align-items:flex-start; gap:10px; padding:10px 12px; background:#f7fafc; border-radius:8px; border:1px solid #e2e8f0; margin-bottom:7px; font-size:12.5px; color:#2d3748; line-height:1.55; }
+    .rec-icon { font-size:16px; flex-shrink:0; margin-top:1px; }
+
+    /* ── History table ── */
+    table { width:100%; border-collapse:collapse; font-size:12.5px; }
+    thead th { background:#f7fafc; padding:9px 12px; text-align:left; font-size:10.5px; font-weight:700; text-transform:uppercase; letter-spacing:.05em; color:#718096; border-bottom:2px solid #e2e8f0; }
+
+    /* ── Footer ── */
+    .footer { margin-top:36px; padding-top:16px; border-top:1px solid #e2e8f0; display:flex; justify-content:space-between; font-size:11px; color:#a0aec0; }
+
+    /* ── Print button ── */
+    .print-btn { display:block; margin:0 auto 32px; padding:11px 32px; background:linear-gradient(135deg,#0ea5e9,#2dd4bf); color:#fff; border:none; border-radius:9px; font-size:14px; font-weight:600; cursor:pointer; font-family:inherit; }
+    .print-btn:hover { opacity:.9; }
+  </style>
+</head>
+<body>
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-mark">❤️</div>
+      <div>
+        <div class="logo-text">CardioCare</div>
+        <div class="logo-sub">AI-Powered Cardiac Risk Assessment</div>
+      </div>
+    </div>
+    <div class="report-meta">
+      <strong>Medical Report</strong>
+      Generated: ${reportDate}
+    </div>
+  </div>
+
+  <!-- Patient Info -->
+  <div class="section-title">Patient Information</div>
+  <div class="info-grid">
+    <div class="info-item"><label>Full Name</label><span>${patient?.name || user?.name || "—"}</span></div>
+    <div class="info-item"><label>Age</label><span>${patient?.age ? patient.age + " years" : "—"}</span></div>
+    <div class="info-item"><label>Sex</label><span>${patient?.sex === 1 ? "Male" : patient?.sex === 0 ? "Female" : "—"}</span></div>
+    <div class="info-item"><label>Email</label><span>${patient?.email || user?.email || "—"}</span></div>
+    <div class="info-item"><label>Phone</label><span>${patient?.phone || "—"}</span></div>
+    <div class="info-item"><label>Blood Type</label><span>${patient?.bloodType || "Unknown"}</span></div>
+    <div class="info-item"><label>Known Allergies</label><span>${patient?.allergies || "None"}</span></div>
+    <div class="info-item"><label>Date of Birth</label><span>${patient?.dob || "—"}</span></div>
+    <div class="info-item"><label>Address</label><span>${patient?.address || "—"}</span></div>
+  </div>
+  ${patient?.medHistory ? `<div style="margin-top:10px"><div class="info-item"><label>Medical History</label><span>${patient.medHistory}</span></div></div>` : ""}
+  ${patient?.notes ? `<div style="margin-top:8px"><div class="info-item"><label>Doctor Notes</label><span>${patient.notes}</span></div></div>` : ""}
+
+  <!-- Risk Score -->
+  <div class="section-title">Cardiovascular Risk Assessment</div>
+  <div class="risk-box">
+    <div class="risk-score-big">${riskScore}%</div>
+    <div>
+      <div class="risk-label">${category}</div>
+      <div class="risk-desc">
+        ${category === "High Risk"
+          ? "This patient presents a high cardiovascular risk. Immediate clinical intervention and specialist referral is strongly recommended."
+          : category === "Moderate Risk"
+          ? "This patient presents a moderate cardiovascular risk. Lifestyle modifications and regular monitoring are advised."
+          : "This patient presents a low cardiovascular risk. Maintenance of current healthy habits is recommended."}
+      </div>
+    </div>
+  </div>
+
+  <!-- Diet Plan -->
+  <div class="section-title">Recommended Diet Plan</div>
+  <div class="diet-title">🥗 ${diet?.title || "—"}</div>
+  <div class="diet-desc">${diet?.desc || ""}</div>
+  <div class="diet-items">
+    ${(diet?.items || []).map((item, i) => `<div class="diet-item"><span>${["🫒","🐟","🌾","🥦","🫐"][i%5]}</span>${item}</div>`).join("")}
+  </div>
+
+  <!-- Recommendations -->
+  <div class="section-title">Clinical Recommendations</div>
+  ${recs.map(r => `<div class="rec-item"><span class="rec-icon">${r.icon}</span><span>${r.text}</span></div>`).join("")}
+
+  <!-- Analysis History -->
+  ${(patient?.history?.length > 0) ? `
+  <div class="section-title">Analysis History</div>
+  <table>
+    <thead><tr><th>Date</th><th>Risk Score</th><th>Category</th></tr></thead>
+    <tbody>${historyRows}</tbody>
+  </table>` : ""}
+
+  <!-- Footer -->
+  <div class="footer">
+    <span>CardioCare AI System • Confidential Medical Document</span>
+    <span>Generated on ${reportDate} • For clinical use only</span>
+  </div>
+
+
+</body>
+</html>`;
+
+  const blob = new Blob([html], { type: "application/octet-stream" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  const name = (patient?.name || user?.name || "Patient").replace(/\s+/g, "_");
+  a.href     = url;
+  a.download = `CardioCare_Report_${name}_${new Date().toISOString().slice(0,10)}.html`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
 // ─── Patient Dashboard ─────────────────────────────────────────────────
-function PatientDashboard({ user, navigate }) {
-  const riskScore = 68;
-  const category  = riskScore < 35 ? "Low Risk" : riskScore < 65 ? "Moderate Risk" : "High Risk";
-  const diet      = getDietPlan(category);
+function PatientDashboard({ user, navigate, patients }) {
+  const [activeNav, setActiveNav] = useState("overview");
+
+  // Find this patient's record by matching their login email
+  const patientRecord = patients.find(
+    p => p.email.toLowerCase() === user?.email?.toLowerCase()
+  ) || null;
+
+  // Use published score from doctor; fall back to null if not yet assessed
+  const riskScore = patientRecord?.lastScore ?? null;
+  const hasScore  = riskScore !== null;
+  const category  = !hasScore ? null : riskScore < 35 ? "Low Risk" : riskScore < 65 ? "Moderate Risk" : "High Risk";
+  const diet      = category ? getDietPlan(category) : null;
   const riskClass = category === "Low Risk" ? "risk-low" : category === "High Risk" ? "risk-high" : "risk-moderate";
-  const trendData = [
-    { month:"Sep", score:74 },{ month:"Oct", score:71 },{ month:"Nov", score:69 },
-    { month:"Dec", score:72 },{ month:"Jan", score:70 },{ month:"Feb", score:riskScore },
-  ];
+
+  // Build trend from patient history + current score
+  const rawHistory = patientRecord?.history || [];
+  const trendData = rawHistory.length > 0
+    ? [...rawHistory].reverse().slice(-6).map(h => ({ month: h.date.split(" ")[0], score: h.score }))
+    : [{ month:"Now", score: riskScore ?? 0 }];
   const recs = [
     { icon:"💊", text:"Blood pressure management — consult your cardiologist for hypertension follow-up" },
     { icon:"🏃", text:"Moderate aerobic exercise: 30-minute walks, 5 days/week" },
     { icon:"💤", text:"Prioritize 7-9 hours of sleep per night to support cardiovascular recovery" },
     { icon:"🚭", text:"Avoid smoking and limit alcohol to fewer than 14 units/week" },
     { icon:"🩺", text:"Schedule follow-up cardiac screening within the next 3 months" },
+  ];
+
+  const navItems = [
+    { key:"overview", icon:"📊", label:"Health Overview" },
+    { key:"diet",     icon:"🥗", label:"Diet Plan" },
+    { key:"recs",     icon:"📋", label:"Recommendations" },
   ];
 
   return (
@@ -1207,8 +1567,10 @@ function PatientDashboard({ user, navigate }) {
           <div style={{ color:"#0ea5e9",fontWeight:600 }}>{user?.name || "Patient"}</div>
         </div>
         <nav className="sidebar-nav">
-          {[{ key:"overview",icon:"📊",label:"Health Overview" },{ key:"diet",icon:"🥗",label:"Diet Plan" }].map(n => (
-            <button key={n.key} className="nav-item active" style={{}}>
+          {navItems.map(n => (
+            <button key={n.key}
+              className={`nav-item ${activeNav === n.key ? "active" : ""}`}
+              onClick={() => setActiveNav(n.key)}>
               {n.icon} {n.label}
             </button>
           ))}
@@ -1218,78 +1580,133 @@ function PatientDashboard({ user, navigate }) {
 
       <main className="dash-main">
         <div style={{ marginBottom:24 }}>
-          <h1 className="page-title">Health Dashboard</h1>
+          <h1 className="page-title">
+            {activeNav === "overview" ? "Health Overview" : activeNav === "diet" ? "Diet Plan" : "Recommendations"}
+          </h1>
           <p className="page-sub">Welcome back, {user?.name || "Patient"} • Last updated: {new Date().toLocaleDateString()}</p>
         </div>
 
-        <div style={{ display:"grid",gridTemplateColumns:"1fr 2fr",gap:18,marginBottom:18 }}>
-          <div className="card" style={{ display:"flex",flexDirection:"column",alignItems:"center",textAlign:"center" }}>
-            <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:16,alignSelf:"flex-start" }}>Heart Health Score</h3>
-            <RiskGauge score={riskScore} />
-            <span className={`risk-badge ${riskClass}`} style={{ marginTop:12 }}>⬤ {category}</span>
-            <p style={{ fontSize:13,color:"#64748b",marginTop:10,lineHeight:1.55 }}>Your cardiovascular risk profile requires attention. Review your personalised plan below.</p>
-            <button className="btn btn-outline btn-sm" style={{ marginTop:14,width:"100%" }}
-              onClick={() => alert(`CardioCare Medical Report\nPatient: ${user?.name||"Patient"}\nRisk Score: ${riskScore}%\nCategory: ${category}\n\nRecommended Diet: ${diet.title}`)}>
-              📥 Download Report PDF
-            </button>
-          </div>
-          <div className="card">
-            <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:18 }}>Risk Score Trend</h3>
-            <ResponsiveContainer width="100%" height={190}>
-              <AreaChart data={trendData} margin={{ top:5,right:10,bottom:5,left:-20 }}>
-                <defs>
-                  <linearGradient id="rg" x1="0" y1="0" x2="0" y2="1">
-                    <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.22}/>
-                    <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
-                  </linearGradient>
-                </defs>
-                <CartesianGrid stroke="rgba(255,255,255,.04)" vertical={false}/>
-                <XAxis dataKey="month" tick={{ fill:"#64748b",fontSize:11 }} axisLine={false} tickLine={false}/>
-                <YAxis domain={[50,90]} tick={{ fill:"#64748b",fontSize:11 }} axisLine={false} tickLine={false}/>
-                <Tooltip contentStyle={{ background:"#1e293b",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,color:"#e2e8f0",fontSize:13 }}/>
-                <Area type="monotone" dataKey="score" stroke="#f43f5e" strokeWidth={2.5} fill="url(#rg)" dot={{ fill:"#f43f5e",r:4 }} activeDot={{ r:6 }}/>
-              </AreaChart>
-            </ResponsiveContainer>
-          </div>
-        </div>
-
-        <div className="card" style={{ marginBottom:18 }}>
-          <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:14 }}>
-            <div>
-              <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:15.5,marginBottom:4 }}>🥗 AI Diet Plan — {diet.title}</h3>
-              <p style={{ fontSize:13.5,color:"#94a3b8",maxWidth:580,lineHeight:1.6 }}>{diet.desc}</p>
+        {/* ── Overview Tab ── */}
+        {activeNav === "overview" && (
+          <div style={{ display:"grid",gridTemplateColumns:"1fr 2fr",gap:18,marginBottom:18 }}>
+            <div className="card" style={{ display:"flex",flexDirection:"column",alignItems:"center",textAlign:"center" }}>
+              <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:16,alignSelf:"flex-start" }}>Heart Health Score</h3>
+              {hasScore ? (
+                <>
+                  <RiskGauge score={riskScore} />
+                  <span className={`risk-badge ${riskClass}`} style={{ marginTop:12 }}>⬤ {category}</span>
+                  <p style={{ fontSize:13,color:"#64748b",marginTop:10,lineHeight:1.55 }}>
+                    {category === "High Risk"
+                      ? "Your cardiovascular risk profile requires urgent attention. Follow your personalised plan below."
+                      : category === "Moderate Risk"
+                      ? "Your risk score is moderate. Follow your personalised plan to improve your heart health."
+                      : "Your heart health looks good. Keep following your maintenance plan."}
+                  </p>
+                  <button className="btn btn-outline btn-sm" style={{ marginTop:14,width:"100%" }}
+                    onClick={() => generatePDFReport({
+                      patient: patientRecord,
+                      user,
+                      riskScore,
+                      category,
+                      diet,
+                      recs,
+                    })}>
+                    📥 Download Report PDF
+                  </button>
+                </>
+              ) : (
+                <div style={{ padding:"24px 0",textAlign:"center" }}>
+                  <div style={{ fontSize:44,marginBottom:12 }}>⏳</div>
+                  <div style={{ fontWeight:600,color:"#e2e8f0",marginBottom:6 }}>No Assessment Yet</div>
+                  <p style={{ fontSize:13,color:"#64748b",lineHeight:1.6 }}>
+                    Your doctor has not yet run an AI analysis for your account.<br/>
+                    Please check back after your next appointment.
+                  </p>
+                </div>
+              )}
             </div>
-            <span className={`risk-badge ${riskClass}`}>{category}</span>
+            <div className="card">
+              <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:18 }}>Risk Score Trend</h3>
+              <ResponsiveContainer width="100%" height={190}>
+                <AreaChart data={trendData} margin={{ top:5,right:10,bottom:5,left:-20 }}>
+                  <defs>
+                    <linearGradient id="rg" x1="0" y1="0" x2="0" y2="1">
+                      <stop offset="5%" stopColor="#f43f5e" stopOpacity={0.22}/>
+                      <stop offset="95%" stopColor="#f43f5e" stopOpacity={0}/>
+                    </linearGradient>
+                  </defs>
+                  <CartesianGrid stroke="rgba(255,255,255,.04)" vertical={false}/>
+                  <XAxis dataKey="month" tick={{ fill:"#64748b",fontSize:11 }} axisLine={false} tickLine={false}/>
+                  <YAxis domain={[0,100]} tick={{ fill:"#64748b",fontSize:11 }} axisLine={false} tickLine={false}/>
+                  <Tooltip contentStyle={{ background:"#1e293b",border:"1px solid rgba(255,255,255,.1)",borderRadius:10,color:"#e2e8f0",fontSize:13 }}/>
+                  <Area type="monotone" dataKey="score" stroke="#f43f5e" strokeWidth={2.5} fill="url(#rg)" dot={{ fill:"#f43f5e",r:4 }} activeDot={{ r:6 }}/>
+                </AreaChart>
+              </ResponsiveContainer>
+            </div>
           </div>
-          <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:10 }}>
-            {diet.items.map((item,i) => (
-              <div key={i} style={{ display:"flex",alignItems:"center",gap:10,padding:"10px 13px",borderRadius:10,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.05)",fontSize:13.5,color:"#cbd5e1" }}>
-                <span style={{ fontSize:17 }}>{["🫒","🐟","🌾","🥦","🫐"][i%5]}</span>{item}
-              </div>
-            ))}
-          </div>
-        </div>
+        )}
 
-        <div className="card">
-          <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:14 }}>Clinical Recommendations</h3>
-          <div style={{ display:"flex",flexDirection:"column",gap:9 }}>
-            {recs.map((r,i) => (
-              <div key={i} style={{ display:"flex",alignItems:"flex-start",gap:11,padding:"11px 13px",background:"rgba(255,255,255,.025)",borderRadius:10,border:"1px solid rgba(255,255,255,.05)" }}>
-                <span style={{ fontSize:17,flexShrink:0 }}>{r.icon}</span>
-                <span style={{ fontSize:13.5,color:"#cbd5e1",lineHeight:1.55 }}>{r.text}</span>
+        {/* ── Diet Tab ── */}
+        {activeNav === "diet" && (
+          <div className="card">
+            {hasScore && diet ? (
+              <>
+                <div style={{ display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:18 }}>
+                  <div>
+                    <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:700,fontSize:15.5,marginBottom:6 }}>🥗 {diet.title}</h3>
+                    <p style={{ fontSize:13.5,color:"#94a3b8",maxWidth:580,lineHeight:1.65 }}>{diet.desc}</p>
+                  </div>
+                  <span className={`risk-badge ${riskClass}`}>{category}</span>
+                </div>
+                <div style={{ display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(210px,1fr))",gap:10 }}>
+                  {diet.items.map((item,i) => (
+                    <div key={i} style={{ display:"flex",alignItems:"center",gap:10,padding:"12px 14px",borderRadius:10,background:"rgba(255,255,255,.03)",border:"1px solid rgba(255,255,255,.06)",fontSize:13.5,color:"#cbd5e1" }}>
+                      <span style={{ fontSize:20 }}>{["🫒","🐟","🌾","🥦","🫐"][i%5]}</span>{item}
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="empty-state">
+                <div className="empty-icon">🥗</div>
+                <div style={{ fontWeight:600,color:"#64748b",marginBottom:6 }}>Diet Plan Pending</div>
+                <p style={{ fontSize:13,color:"#475569" }}>Your personalised diet plan will appear here once your doctor completes your AI risk assessment.</p>
               </div>
-            ))}
+            )}
           </div>
-        </div>
+        )}
+
+        {/* ── Recommendations Tab ── */}
+        {activeNav === "recs" && (
+          <div className="card">
+            <h3 style={{ fontFamily:"'Space Grotesk',sans-serif",fontWeight:600,fontSize:14.5,marginBottom:16 }}>Clinical Recommendations</h3>
+            <div style={{ display:"flex",flexDirection:"column",gap:9 }}>
+              {recs.map((r,i) => (
+                <div key={i} style={{ display:"flex",alignItems:"flex-start",gap:11,padding:"13px 15px",background:"rgba(255,255,255,.025)",borderRadius:10,border:"1px solid rgba(255,255,255,.05)" }}>
+                  <span style={{ fontSize:18,flexShrink:0 }}>{r.icon}</span>
+                  <span style={{ fontSize:13.5,color:"#cbd5e1",lineHeight:1.55 }}>{r.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
 }
 
 // ─── Root ──────────────────────────────────────────────────────────────
+// patients state lives here so BOTH dashboards share the same data.
+// Persisted to localStorage so new patients survive page refreshes & re-logins.
 export default function App() {
-  const [page, setPage]     = useState("landing");
-  const [data, setData]     = useState({});
+  const [page, setPage]         = useState("landing");
+  const [data, setData]         = useState({});
+
+  // Load from localStorage on first render; fall back to seed data if empty
+  const [patients, setPatients] = useState(() => loadPatients() || INITIAL_PATIENTS);
+
+  // Persist every time patients changes
+  useEffect(() => { savePatients(patients); }, [patients]);
 
   useEffect(() => {
     const el = document.createElement("style");
@@ -1304,11 +1721,11 @@ export default function App() {
 
   return (
     <div>
-      {page === "landing"          && <LandingPage   navigate={navigate} />}
-      {page === "login"            && <AuthPage      navigate={navigate} mode="login"  defaultTab={data.tab} />}
-      {page === "signup"           && <AuthPage      navigate={navigate} mode="signup" />}
-      {page === "doctor-dashboard" && <DoctorDashboard user={data.user} navigate={navigate} />}
-      {page === "patient-dashboard"&& <PatientDashboard user={data.user} navigate={navigate} />}
+      {page === "landing"           && <LandingPage   navigate={navigate} />}
+      {page === "login"             && <AuthPage      navigate={navigate} mode="login"  defaultTab={data.tab} />}
+      {page === "signup"            && <AuthPage      navigate={navigate} mode="signup" />}
+      {page === "doctor-dashboard"  && <DoctorDashboard  user={data.user} navigate={navigate} patients={patients} setPatients={setPatients} />}
+      {page === "patient-dashboard" && <PatientDashboard user={data.user} navigate={navigate} patients={patients} />}
       <ChatBot />
     </div>
   );
